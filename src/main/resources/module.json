@@ -1,0 +1,12 @@
+{
+  "name": "Meridian World Map",
+  "version": "${project.version}",
+  "main": "meridian.worldmap.WorldMapModule",
+  "priority": 100,
+  "dependsOn": {
+    "meridian-core": ">=0.2.0"
+  },
+  "requires": {
+    "services": ["meridian.core.api.WorldMap"]
+  }
+}
