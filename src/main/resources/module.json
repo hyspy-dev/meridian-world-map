@@ -4,7 +4,7 @@
   "main": "meridian.worldmap.WorldMapModule",
   "priority": 100,
   "dependsOn": {
-    "meridian-core": ">=0.2.0"
+    "meridian-core": ">=1.2.0"
   },
   "requires": {
     "services": ["meridian.core.api.WorldMap"]
