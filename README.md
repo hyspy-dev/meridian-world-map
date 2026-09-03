@@ -1,8 +1,8 @@
 # Meridian World Map
 
-Keeps the map of the world you are playing — every tile the server has drawn for you — and gives
-you a window to look at it in. The in-game map only shows what is around you and forgets the rest;
-this remembers all of it, across worlds and across sessions, and lets you pan and zoom over
+Keeps the map of every world you play in — every tile the server has drawn for you — and gives you
+a window to look at them in. The in-game map only shows what is around you and forgets the rest;
+this remembers all of it, world by world, across sessions, and lets you pan and zoom over
 everything you have ever seen.
 
 It is two things in one file:
@@ -22,10 +22,11 @@ Nothing here reads or sends a packet, so one build works with every version of t
 
 **In the proxy.** The module appears as *Meridian World Map* in the settings, with three controls:
 
+
 | Setting | What it does |
 |---------|--------------|
 | Keep the map across sessions | writes the map down. Turn it off and the map still works while you play, but nothing is saved |
-| Keep every tile the server draws | on: everything the server shows you. Off: only the tiles whose ground you have actually collected — see below |
+| Show every tile in full colour | on: the whole map as the server drew it. Off: ground you have not collected is faded — see below |
 | Open map | opens the window. Tiles appear in it as they arrive |
 
 **On its own.** Double-click the jar, or run it from a terminal:
@@ -34,30 +35,38 @@ Nothing here reads or sends a packet, so one build works with every version of t
 java -jar meridian-world-map.jar [path/to/worldmap.dat]
 ```
 
-Without a path it looks for the map in its own folder beside the jar. The window is read-only:
-drag to pan, wheel to zoom, *Follow player* keeps it centred while you play, *Reset view* fits
-everything on screen. The status line shows the block coordinates under the cursor.
+Without a path it looks for the map in its own folder beside the jar. Drag to pan, wheel to zoom,
+*Follow player* keeps it centred while you play, *Reset view* fits everything on screen. The status
+line shows the block coordinates under the cursor.
+
+**Every world is in there.** One archive holds each world you have visited, and the toolbar's
+*World* picker says which one is on screen — with how many tiles each has, largest first. Switching
+rebuilds the map for that world: its tiles, its markers, and the player only when they are actually
+standing in it. A world entered while the window is open joins the list on its own.
+
+**Right-click to go there.** With a module installed that can teleport, right-clicking anywhere on
+the map takes the player to that spot — the height at the column is worked out for you. Without
+one, the map says so and stays a map.
 
 **The map file** lives in `<modules>/Meridian World Map/data/worldmap.dat`. It is yours: copy it,
 back it up, or hand it to the standalone window on another machine.
 
 ---
 
-## What gets kept
+## Collected ground, and the rest
 
 The server draws a tile for ground it merely shows you, which is a good deal more than the ground
-it sends you in full. Both are worth having, and they are different maps:
+it sends you in full — a coastline seen from a hilltop is on your map long before you walk it.
+**Every tile is kept**, both kinds: a map is a record, and the far shore is worth having.
 
-- **Every tile** gives a wide, thin map — everywhere you have glimpsed, including across water and
-  from hilltops.
-- **Only collected ground** gives a map that matches the world you actually hold, tile for chunk.
+What the setting changes is how they are drawn. With *Show every tile in full colour* off, ground
+nobody has collected is faded — half its colour and half its light — so one look says where you
+have actually been while the shape of the land still reads. Turn it on and the whole map is drawn
+as the server painted it.
 
-The second one needs something else running that collects the world and can say which ground it
-has; with nothing to ask, the setting makes no difference and every tile is kept. The map is
-worth running on its own either way — it needs no companion module and asks for none.
-
-Tiles from earlier sessions are kept whichever way the setting is turned. They passed the same
-test when they were written, and a map does not un-remember.
+Telling the two apart needs something that collects the world and can say which ground it has;
+with nothing to ask, there is nothing to fade and the map is drawn plainly. The map needs no
+companion module and asks for none.
 
 ---
 
@@ -77,13 +86,34 @@ ecosystem keeps, or a plain list of markers.
 
 ## How the map is stored
 
-Tiles are kept at the size the server draws them (96 pixels a side in the current build) and
-**decoded** — plain RGB, not the form they arrived in. The wire format belongs to one version of
-the game and a map you keep for months should outlive that. Maps written by earlier builds held the
-wire form; they are still read, and rewritten decoded, so nothing collected is lost.
+A **table**, not a stream. Every tile is addressed by its world and its column, so writing one
+again replaces it in place — the same ground walked over a hundred times takes the room of one
+tile, and the file cannot fill with old copies of itself.
 
-The window draws through a pyramid of pre-scaled levels built in the background, so zooming out
-over a large map stays smooth and the interface never waits on an image.
+```
+  0  "MMP3"   what this is        64  data segments …
+  4  version                          directory: one record a tile
+  8  directory offset  <- the commit
+```
+
+That shape is what makes the rest work:
+
+- **Opening is instant.** Only the directory is read — a 147 MB map opens in a hundredth of a
+  second, and tiles are read as they are drawn. Nothing is held in memory but what is on screen.
+- **A crash cannot cost the map.** Tile bytes go into free space, then the directory is written
+  somewhere free, and only then does the header point at it. Every step before the last leaves
+  the file exactly as it was, and the last is a few bytes at a fixed place.
+- **A session cannot shrink the map.** It writes its own tiles and nothing else; there is no pass
+  that rewrites the file from what one session happens to hold.
+- **An unchanged tile is not written.** The directory keeps a checksum, and a server that re-sends
+  the same picture every time you walk past costs nothing.
+
+Tiles are kept at the size the server draws them (96 pixels a side in the current build), decoded
+and deflated one by one with what the JDK ships — the map has to open on a double-click, with
+nothing on the class path but itself.
+
+Maps written by earlier builds were one long gzip stream. The first time such a map is opened it
+is converted, once, and the original is kept beside it as `worldmap.dat.v2`.
 
 ---
 

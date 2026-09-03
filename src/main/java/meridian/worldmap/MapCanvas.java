@@ -45,12 +45,38 @@ final class MapCanvas extends JPanel {
      * about 7, which keeps the recursion bounded to ~16k per tile.
      */
     private static final double MIN_PIXELS_PER_BLOCK = 0.01;
-    /** Hard ceiling — 1 screen px per block = native resolution of the source MapImage. No upscaling allowed. */
-    private static final double MAX_PIXELS_PER_BLOCK = 1.0;
+    /**
+     * How far in the map will go: two screen pixels a block.
+     *
+     * <p>Still short of what a tile actually holds. The server draws a chunk column at
+     * ninety-six pixels to thirty-two blocks - three pixels a block - so this is a closer look
+     * at a picture that already has the detail, not an enlargement of one that does not. One
+     * pixel a block, which is where this used to stop, threw two thirds of it away.
+     */
+    private static final double MAX_PIXELS_PER_BLOCK = 2.0;
     private static final double ZOOM_FACTOR_PER_NOTCH = 1.25;
+
+    /**
+     * Where the map starts, and where the reset button puts it back: one screen pixel a block.
+     *
+     * <p>Close enough to read the ground rather than the shape of the continent. Opening on the
+     * whole world instead put every session in the widest view there is - which is the one view
+     * that is drawn from pictures standing for sixty-four columns each, and the one people were
+     * least often after.
+     */
+    private static final double DEFAULT_PIXELS_PER_BLOCK = 1.0;
     /** A chunk column is 32 blocks per side - which has nothing to do with how many pixels
      *  the server draws for it. */
     private static final int BLOCKS_PER_CHUNK = 32;
+
+    /**
+     * How many missing tiles one frame may ask for, and how far out it looks for them.
+     *
+     * <p>A window is about a hundred and thirty tiles; asking for half as many again each frame
+     * fills a cold view in a moment while leaving the builder free to keep up with what arrives.
+     */
+    private static final int ASK_PER_TICK = 64;
+    private static final int MAX_RINGS = 64;
 
     private final TilePyramid pyramid;
     private final WorldMapStore store;
@@ -72,11 +98,13 @@ final class MapCanvas extends JPanel {
      * as its own shape, which is what the map did before there were any pictures at all.
      */
     private final Function<String, Image> icons;
+    /** Where a right click sends the player, when anything can send them anywhere. */
+    private final java.util.function.BiConsumer<Integer, Integer> teleport;
 
     // Viewport state.
     private double centerWorldX;
     private double centerWorldZ;
-    private double pixelsPerBlock = 0.25;
+    private double pixelsPerBlock = DEFAULT_PIXELS_PER_BLOCK;
 
     // Drag state.
     private Point dragStart;
@@ -89,6 +117,16 @@ final class MapCanvas extends JPanel {
     // Diagnostic for status bar.
     private int lastTilesDrawn;
     private int lastLevel;
+    private volatile int lastVisible;
+    private volatile int lastMissing;
+
+    /** What the last frame was looking at, read by the window's tick from another thread. */
+    private final Object view = new Object();
+    private int viewLevel;
+    private int viewMinX;
+    private int viewMaxX = Integer.MIN_VALUE;
+    private int viewMinZ;
+    private int viewMaxZ = Integer.MIN_VALUE;
 
     MapCanvas(TilePyramid pyramid,
               WorldMapStore store,
@@ -96,6 +134,7 @@ final class MapCanvas extends JPanel {
               Supplier<int[]> playerChunkSupplier,
               Supplier<List<Place>> markers,
               Function<String, Image> icons,
+              java.util.function.BiConsumer<Integer, Integer> teleport,
               Consumer<String> statusSink) {
         this.pyramid = pyramid;
         this.store = store;
@@ -103,6 +142,7 @@ final class MapCanvas extends JPanel {
         this.playerChunkSupplier = playerChunkSupplier;
         this.markers = markers;
         this.icons = icons;
+        this.teleport = teleport;
         this.statusSink = statusSink;
 
         setBackground(new Color(18, 20, 24));
@@ -113,6 +153,10 @@ final class MapCanvas extends JPanel {
         MouseAdapter mouse = new MouseAdapter() {
             @Override
             public void mousePressed(MouseEvent e) {
+                if (javax.swing.SwingUtilities.isRightMouseButton(e)) {
+                    goThere(e.getX(), e.getY());
+                    return;                     // a right click is a destination, not a drag
+                }
                 dragStart = e.getPoint();
                 dragStartCenterX = centerWorldX;
                 dragStartCenterZ = centerWorldZ;
@@ -187,6 +231,19 @@ final class MapCanvas extends JPanel {
      * fit-to-data path can't compute zoom; we defer with {@code invokeLater}
      * until Swing finishes layout.
      */
+    /**
+     * Puts the view somewhere exactly - for measuring what a frame costs at a given zoom.
+     *
+     * <p>The window itself never calls this: it pans and zooms with the mouse. It is here so a
+     * bench can ask "what does playing at this zoom cost" without pretending to be a mouse.
+     */
+    void zoomTo(double pixelsPerBlock, double worldX, double worldZ) {
+        this.pixelsPerBlock = pixelsPerBlock;
+        this.centerWorldX = worldX;
+        this.centerWorldZ = worldZ;
+        followPlayer = false;
+    }
+
     void resetView() {
         if (getWidth() <= 0 || getHeight() <= 0) {
             javax.swing.SwingUtilities.invokeLater(this::resetView);
@@ -196,19 +253,19 @@ final class MapCanvas extends JPanel {
         if (pc != null) {
             centerWorldX = pc[0] * (double) BLOCKS_PER_CHUNK + BLOCKS_PER_CHUNK / 2.0;
             centerWorldZ = pc[1] * (double) BLOCKS_PER_CHUNK + BLOCKS_PER_CHUNK / 2.0;
-            pixelsPerBlock = 0.25;
         } else {
-            fitToTiles();
+            centreOnTiles();
         }
+        pixelsPerBlock = DEFAULT_PIXELS_PER_BLOCK;
         repaint();
     }
 
-    private void fitToTiles() {
+    /** Puts the middle of the map in the middle of the window, without changing how close it is. */
+    private void centreOnTiles() {
         int[] bounds = store.tileBounds(world);
         if (bounds == null) {
             centerWorldX = 0;
             centerWorldZ = 0;
-            pixelsPerBlock = 0.25;
             return;
         }
         int minBlockX = bounds[0] * BLOCKS_PER_CHUNK;
@@ -217,13 +274,6 @@ final class MapCanvas extends JPanel {
         int maxBlockZ = (bounds[3] + 1) * BLOCKS_PER_CHUNK;
         centerWorldX = (minBlockX + maxBlockX) / 2.0;
         centerWorldZ = (minBlockZ + maxBlockZ) / 2.0;
-        int w = Math.max(1, getWidth());
-        int h = Math.max(1, getHeight());
-        double zoomX = (double) w / (maxBlockX - minBlockX);
-        double zoomZ = (double) h / (maxBlockZ - minBlockZ);
-        // 0.92 leaves a small margin around the data so edge tiles aren't clipped.
-        pixelsPerBlock = clamp(Math.min(zoomX, zoomZ) * 0.92,
-                MIN_PIXELS_PER_BLOCK, MAX_PIXELS_PER_BLOCK);
     }
 
     void setFollowPlayer(boolean follow) {
@@ -281,13 +331,19 @@ final class MapCanvas extends JPanel {
             return;
         }
 
-        // Pick pyramid level: one pyramid pixel ≈ one screen pixel (or up to
-        // 2× downscaled). Each level halves resolution, so:
-        //   level = max(0, ceil(-log2(pixelsPerBlock)))
-        // Also cap by the data's natural extent — building higher levels is
-        // pointless once a single super-tile already covers the whole world.
-        int desiredLevel = Math.max(0, (int) Math.ceil(-log2(pixelsPerBlock)));
-        int level = Math.min(desiredLevel, maxUsefulLevel());
+        // Which level to draw from: the coarsest one that still has a source pixel for every
+        // screen pixel. A tile's picture is the same size at every level while covering four
+        // times the ground, so going one level coarser quarters the number of tiles to draw
+        // without costing anything the eye can see - and drawing is what a frame is made of.
+        //
+        // At one pixel a block the old rule picked level 0: nine hundred tiles a frame, each
+        // shrunk three-fold. The same view from level 1 is two hundred, barely shrunk at all.
+        double sourcePixelsPerBlock = pyramid.tileSize() / (double) BLOCKS_PER_CHUNK;
+        int desiredLevel = Math.max(0, (int) Math.floor(log2(sourcePixelsPerBlock / pixelsPerBlock)));
+        // Four steps, and no more. Past the widest one the same pictures are simply drawn
+        // smaller: a step costs four times less to draw and four times more to keep, and beyond
+        // sixty-four blocks to the pixel there is nothing left in them to lose.
+        int level = Math.min(Math.min(desiredLevel, maxUsefulLevel()), pyramid.topLevel());
         int blocksPerTile = BLOCKS_PER_CHUNK << level;
         double screenPxPerTile = blocksPerTile * pixelsPerBlock;
 
@@ -325,13 +381,22 @@ final class MapCanvas extends JPanel {
                         : RenderingHints.VALUE_INTERPOLATION_BILINEAR);
 
         int drawn = 0;
+        // Remember what this frame is looking at, so the window's tick can go on filling it in
+        // without waiting for another frame - and so it only ever asks for what is on screen.
+        synchronized (view) {
+            viewLevel = level;
+            viewMinX = superMinX;
+            viewMaxX = superMaxX;
+            viewMinZ = superMinZ;
+            viewMaxZ = superMaxZ;
+        }
+        topUp();
+
         for (int sz = superMinZ; sz <= superMaxZ; sz++) {
             for (int sx = superMinX; sx <= superMaxX; sx++) {
                 BufferedImage tile = pyramid.tileIfCached(level, sx, sz);
                 if (tile == null) {
-                    // Kick off async build — next paint will pick it up when ready.
-                    pyramid.requestBuild(level, sx, sz);
-                    continue;
+                    continue;               // asked for above, or waiting its turn
                 }
                 double tileWorldX = (long) sx * blocksPerTile;
                 double tileWorldZ = (long) sz * blocksPerTile;
@@ -368,6 +433,10 @@ final class MapCanvas extends JPanel {
         }
 
         drawMarkers(g, w, h);
+
+        // Let go of what is far from here: a built tile is an image, and a map of twenty thousand
+        // of them would otherwise sit in memory whole for the rest of the session.
+        pyramid.retain(worldMinX, worldMinZ, worldMaxX, worldMaxZ);
 
         lastTilesDrawn = drawn;
         lastLevel = level;
@@ -477,6 +546,93 @@ final class MapCanvas extends JPanel {
         g2.drawString(name, tx + 1, tz + 1);
         g2.setColor(new Color(255, 255, 255, alpha));
         g2.drawString(name, tx, tz);
+    }
+
+    /**
+     * Take the player to the place under the pointer.
+     *
+     * <p>Only when something can: teleporting is somebody else's business, and the window opened
+     * on its own has nobody to ask. Then a right click is simply a right click.
+     */
+    private void goThere(int mouseX, int mouseY) {
+        int worldX = (int) Math.floor(centerWorldX + (mouseX - getWidth() / 2.0) / pixelsPerBlock);
+        int worldZ = (int) Math.floor(centerWorldZ + (mouseY - getHeight() / 2.0) / pixelsPerBlock);
+        if (teleport == null) {
+            say("Right click goes there - with the teleport module installed");
+            return;
+        }
+        try {
+            teleport.accept(worldX, worldZ);
+            say("Going to " + worldX + ", " + worldZ);
+        } catch (RuntimeException e) {
+            say("Could not go to " + worldX + ", " + worldZ + ": "
+                    + (e.getMessage() == null ? e.toString() : e.getMessage()));
+        }
+    }
+
+    /** A line in the status bar that survives until the next repaint says otherwise. */
+    private void say(String message) {
+        if (statusSink != null) {
+            statusSink.accept(message);
+        }
+    }
+
+    /**
+     * Asks for some of what is missing on screen, nearest the middle first.
+     *
+     * <p>Called by the window on its tick as well as while painting, so a map fills itself out
+     * steadily and cannot stall - it used to stop dead when a batch of tiles came back empty and
+     * nothing spoke up to ask for the next.
+     *
+     * @return how many tiles this call set going
+     */
+    int topUp() {
+        int level;
+        int minX;
+        int maxX;
+        int minZ;
+        int maxZ;
+        synchronized (view) {
+            level = viewLevel;
+            minX = viewMinX;
+            maxX = viewMaxX;
+            minZ = viewMinZ;
+            maxZ = viewMaxZ;
+        }
+        if (maxX < minX || maxZ < minZ) {
+            return 0;                       // nothing has been drawn yet
+        }
+        int centreX = (minX + maxX) / 2;
+        int centreZ = (minZ + maxZ) / 2;
+        int asked = 0;
+        int missing = 0;
+        for (int ring = 0; ring <= MAX_RINGS; ring++) {
+            for (int sz = centreZ - ring; sz <= centreZ + ring; sz++) {
+                for (int sx = centreX - ring; sx <= centreX + ring; sx++) {
+                    boolean onTheRing = Math.abs(sx - centreX) == ring
+                            || Math.abs(sz - centreZ) == ring;
+                    if (!onTheRing || sx < minX || sx > maxX || sz < minZ || sz > maxZ) {
+                        continue;           // only what is on screen
+                    }
+                    if (pyramid.tileIfCached(level, sx, sz) != null) {
+                        continue;
+                    }
+                    missing++;
+                    if (asked < ASK_PER_TICK && pyramid.requestBuild(level, sx, sz)) {
+                        asked++;
+                    }
+                }
+            }
+        }
+        lastMissing = missing;
+        lastVisible = (maxX - minX + 1) * (maxZ - minZ + 1);
+        return asked;
+    }
+
+    /** What the last frame saw, for the line the window writes to the log. */
+    String frame() {
+        return "level=" + lastLevel + " onscreen=" + lastVisible + " drawn=" + lastTilesDrawn
+                + " missing=" + lastMissing;
     }
 
     private void pushHoverStatus(int mouseX, int mouseY) {

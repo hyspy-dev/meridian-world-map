@@ -60,8 +60,34 @@ final class CoreMarkers {
         return services.get(MapMarkers.class).orElse(null);
     }
 
-    /** Everything worth drawing on this world's map. */
+    /** What was handed out last, and when - the window asks on every frame it draws. */
+    private volatile List<Place> lastPlaces = List.of();
+    private volatile UUID lastWorld;
+    private volatile long lastAsked;
+
+    /** How long a list of markers is good for. Markers move at walking pace, frames do not. */
+    private static final long FRESH_NANOS = 250_000_000L;
+
+    /**
+     * Everything worth drawing on this world's map.
+     *
+     * <p>Kept for a quarter of a second between asks. The window redraws many times a second and
+     * each redraw used to rebuild every marker from scratch, which on a busy server is most of
+     * what a frame cost.
+     */
     List<Place> places(UUID world) {
+        long now = System.nanoTime();
+        if (world != null && world.equals(lastWorld) && now - lastAsked < FRESH_NANOS) {
+            return lastPlaces;
+        }
+        List<Place> fresh = build(world);
+        lastPlaces = fresh;
+        lastWorld = world;
+        lastAsked = now;
+        return fresh;
+    }
+
+    private List<Place> build(UUID world) {
         List<Marker> markers = null;
         MarkerSource kept = kept();
         if (kept != null && world != null) {
