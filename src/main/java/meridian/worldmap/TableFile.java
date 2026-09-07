@@ -142,7 +142,7 @@ final class TableFile implements Closeable {
     }
 
     /**
-     * One tile, read on demand.
+     * One tile, read on demand, and checked against what the directory says it should be.
      *
      * <p>Nothing is held in memory but the directory, so opening a map of any size costs the same
      * and only the ground being looked at is ever decoded.
@@ -170,11 +170,52 @@ final class TableFile implements Closeable {
                 }
             }
             byte[] rgb = inflate(buffer.array(), slot.size() * slot.size() * 3);
+            // What came out has to be what the record says went in. A tile written over by
+            // another - which is what a damaged file holds - unpacks perfectly well and is
+            // somebody else's ground: water in the middle of a continent, and no error anywhere
+            // to say so. Worse, it is sticky. The checksum in the record is the one the picture
+            // had before it was lost, so when the server sends that picture again it matches,
+            // the map says it already has it, and nothing is ever written. The one number that
+            // can tell is right here and was never looked at.
+            if (checksum(rgb) != slot.checksum()) {
+                forget(world, key, slot);
+                return null;
+            }
             return Tile.fromRgb(WorldMapStore.chunkX(key), WorldMapStore.chunkZ(key),
                     slot.size(), rgb);
         } catch (IOException | RuntimeException e) {
-            return null;                    // one unreadable tile is a hole, not a broken map
+            forget(world, key, slot);       // one unreadable tile is a hole, not a broken map
+            return null;
         }
+    }
+
+    /**
+     * Drops a tile the file cannot give back, or gives back wrongly.
+     *
+     * <p>Neither is a tile, and a table that goes on saying it holds one is a table that will
+     * never take that tile again: the server sends the same picture, the checksum in the directory
+     * says it is already had, and the ground stays lost for the life of the map. Letting go of it
+     * is what lets it be collected again the next time somebody walks past.
+     *
+     * <p>Only when the file is still open. A read that fails because the map is closing is the map
+     * closing, not a damaged tile.
+     *
+     * <p>The claim goes; the space does not. In a file damaged by the old allocator two tiles can
+     * share bytes, and the one that cannot be read may be sharing them with one that can - handing
+     * that run back would offer a living tile's bytes to the next thing written. The space comes
+     * back on its own at the next open, where it is worked out from what the directory says rather
+     * than from what a broken record claims.
+     */
+    private synchronized void forget(UUID world, long key, Slot slot) {
+        if (!channel.isOpen()) {
+            return;
+        }
+        Map<Long, Slot> tiles = index.get(world);
+        if (tiles == null || tiles.get(key) != slot) {
+            return;                         // written again since: what is there now is not this
+        }
+        tiles.remove(key);
+        dirty = true;
     }
 
     /**
@@ -350,10 +391,19 @@ final class TableFile implements Closeable {
     }
 
     /**
-     * What the file is not using: everything between the runs the directory names.
+     * What the file is not using: everything between the runs the directory names, and everything
+     * after the last of them.
      *
      * <p>Worked out at open rather than stored, so a session that died mid-write leaves no stale
      * bookkeeping behind - whatever it wrote but never pointed at is simply free again.
+     *
+     * <p>{@link #end} is where the <em>file</em> stops, not where the tiles do. The difference is
+     * the whole of this: the space past the last tile is a hole like any other and is handed out
+     * like any other, so if {@code end} were set to where the tiles stop, it would point at bytes
+     * this list had already promised to somebody. It did, and a run of tiles that had been given
+     * that space was written over by the next tile that found no hole to fit in - a few hundred
+     * kilobytes of map, gone, in a file that reported itself whole. Both mouths of the allocator
+     * now bite in different places: the holes below {@code end}, and new ground above it.
      */
     private void rebuildFreeList(List<long[]> used) throws IOException {
         used.sort((a, b) -> Long.compare(a[0], b[0]));
@@ -369,7 +419,6 @@ final class TableFile implements Closeable {
         if (end > at) {
             free.put(at, (int) Math.min(Integer.MAX_VALUE, end - at));
         }
-        end = at;
     }
 
     /** A run of whole segments big enough for these bytes: reused if there is a hole, else added. */
@@ -430,11 +479,22 @@ final class TableFile implements Closeable {
         try {
             deflater.setInput(raw);
             deflater.finish();
+            // Until it says it is finished, and not one call: a single deflate() may hand back
+            // less than all of it, and what it hands back is a piece of a stream that no longer
+            // unpacks. A tile written that way reads as damage, and reads as damage for ever.
             byte[] out = new byte[raw.length + 64];
-            int length = deflater.deflate(out);
-            byte[] exact = new byte[length];
-            System.arraycopy(out, 0, exact, 0, length);
-            return exact;
+            int length = 0;
+            while (!deflater.finished()) {
+                if (length == out.length) {
+                    out = java.util.Arrays.copyOf(out, out.length * 2);
+                }
+                int packed = deflater.deflate(out, length, out.length - length);
+                if (packed == 0 && !deflater.finished()) {
+                    break;                  // it wants input it will never get: stop rather than spin
+                }
+                length += packed;
+            }
+            return java.util.Arrays.copyOf(out, length);
         } finally {
             deflater.end();
         }

@@ -125,12 +125,12 @@ public final class MapViewer extends JFrame {
         setLocationRelativeTo(null);
         setDefaultCloseOperation(DISPOSE_ON_CLOSE);
 
-        // A tile arriving refreshes the map, and a world arriving joins the list. Both come from
-        // the archive, which is written to while the window is open.
+        // A tile arriving refreshes the map. It comes from the archive, which is written to while
+        // the window is open - and from whichever thread wrote it, so this does as little as it
+        // can and leaves the rest to the window's own clock. Asking the archive how many worlds
+        // it holds is one of the things it must not do: that reads the file's directory under its
+        // lock, and it was being asked once per arriving tile.
         this.storeListener = (uuid, key) -> {
-            if (worlds.getItemCount() != store.worlds().size()) {
-                SwingUtilities.invokeLater(this::listWorlds);
-            }
             if (!uuid.equals(this.world)) {
                 return;
             }
@@ -204,6 +204,9 @@ public final class MapViewer extends JFrame {
         long now = System.currentTimeMillis();
         if (now - saidAt >= SAY_EVERY_MILLIS) {
             saidAt = now;
+            if (worlds.getItemCount() != store.worlds().size()) {
+                listWorlds();               // a world nobody had seen before has tiles now
+            }
             String line = "world " + (world == null ? "?" : world.toString().substring(0, 8))
                     + "  " + canvas.frame() + "  " + pyramid.work()
                     + "  asked=" + asked;

@@ -169,6 +169,49 @@ final class TilePyramid {
         }
     }
 
+    /**
+     * Paints into the wide view everything noted since the last time, and keeps at it until
+     * nothing is left.
+     *
+     * <p>On the wide view's own thread, behind the sweep if one is running. Reading the tiles is
+     * this thread's work, not the caller's: what notices ground arriving is the connection, and
+     * a map file read there is a game that stops while it happens.
+     */
+    private void paintWideDirty() {
+        for (;;) {
+            List<Long> batch;
+            synchronized (wideDirty) {
+                batch = new ArrayList<>(wideDirty);
+                wideDirty.clear();
+            }
+            if (batch.isEmpty()) {
+                widePainting.set(false);
+                // Anything noted between the copy and here found the flag set and went away
+                // again, so look once more before leaving - and only take the work if it is
+                // still nobody's.
+                synchronized (wideDirty) {
+                    if (wideDirty.isEmpty() || !widePainting.compareAndSet(false, true)) {
+                        return;
+                    }
+                }
+                continue;
+            }
+            for (long key : batch) {
+                if (Thread.currentThread().isInterrupted()) {
+                    widePainting.set(false);
+                    return;                 // the window is closing
+                }
+                Tile tile = store.tile(world, key);
+                if (tile != null) {
+                    paintWide(tile);
+                }
+            }
+            if (onTileBuilt != null) {
+                onTileBuilt.run();          // and say so, or the window never draws it
+            }
+        }
+    }
+
     /** Lays one tile into the wide picture that covers it, at the size it is worth there. */
     private void paintWide(Tile tile) {
         BufferedImage source = tile.toImage();
@@ -218,6 +261,16 @@ final class TilePyramid {
      */
     private static final double KEPT_SCREENS = 1.0;
 
+    /**
+     * The most memory the built tiles may take, all levels together.
+     *
+     * <p>Counted in bytes rather than tiles because a tile is not a fixed size - a server that
+     * draws 96 pixels a side makes each one nine times what a 32-pixel one costs, and a budget in
+     * tiles would quietly mean nine times the memory. What the pyramid holds is worked back from
+     * this and the size in hand.
+     */
+    private static final long MEMORY_BUDGET_BYTES = 96L * 1024 * 1024;
+
     /** Sweeping is cheap but not free; once a second is plenty when the view is moving. */
     private static final long SWEEP_NANOS = 1_000_000_000L;
 
@@ -251,6 +304,11 @@ final class TilePyramid {
 
     /** The wide view, painted once from the ground up and kept: level {@value #COARSE}. */
     private final Map<Long, BufferedImage> coarse = new HashMap<>();
+    /** Squares of the wide view whose ground has changed - guarded by itself. */
+    private final Set<Long> wideDirty = new HashSet<>();
+    /** Whether somebody is already working through them, so only ever one does. */
+    private final java.util.concurrent.atomic.AtomicBoolean widePainting =
+            new java.util.concurrent.atomic.AtomicBoolean();
     private final java.util.concurrent.atomic.AtomicBoolean sweeping =
             new java.util.concurrent.atomic.AtomicBoolean();
     private volatile int sweptTiles;
@@ -296,33 +354,46 @@ final class TilePyramid {
      * Lets go of everything far from what is being looked at.
      *
      * <p>A built tile is an image, and a large map has tens of thousands of them: kept for the
-     * whole session they would fill memory with ground nobody is looking at any more. What is on
-     * screen, and one screen out in each direction, stays; the rest is dropped and simply built
-     * again if it comes back. Called after painting, and it does its work at most once a second.
+     * whole session they would fill memory with ground nobody is looking at any more. Two things
+     * decide what stays: a box around the middle of the window - as many tiles either way as the
+     * window is drawing and one screen further, the same count at every level and measured in
+     * that level's own tiles - and a budget in bytes that no zoom can talk its way past. What
+     * falls outside is dropped and simply built again if it comes back; what the frame is drawing
+     * is never dropped at all.
      *
+     * <p>Called after painting, and it does its work at most once a second.
+     *
+     * @param drawnLevel the level this frame drew from
      * @param minX the world rectangle on screen, in blocks
      */
-    void retain(double minX, double minZ, double maxX, double maxZ) {
+    void retain(int drawnLevel, double minX, double minZ, double maxX, double maxZ) {
         long now = System.nanoTime();
         synchronized (this) {
             if (now - sweptAt < SWEEP_NANOS || cached() <= SWEEP_FLOOR) {
                 return;
             }
             sweptAt = now;
-            double marginX = (maxX - minX) * KEPT_SCREENS;
-            double marginZ = (maxZ - minZ) * KEPT_SCREENS;
-            double keepMinX = minX - marginX;
-            double keepMaxX = maxX + marginX;
-            double keepMinZ = minZ - marginZ;
-            double keepMaxZ = maxZ + marginZ;
+            Frame frame = Frame.of(drawnLevel, minX, minZ, maxX, maxZ);
+            // How much a level keeps is counted in its own tiles, not in blocks: as many either
+            // way as the frame is drawing, and one screen further. That is the whole of it.
+            //
+            // Measuring it in blocks is what let the map hold everything at once - a level-two
+            // screen is sixteen times the ground of a level-zero one, so "one screen out" at
+            // level zero meant the entire world and nothing was ever far away. Measured in tiles,
+            // what a level holds is the same however far out the window is zoomed, and what it
+            // holds is the middle - which is where the eye is, and where a zoom lands.
+            double keepWide = frame.halfWide() * (1 + 2 * KEPT_SCREENS);
+            double keepTall = frame.halfTall() * (1 + 2 * KEPT_SCREENS);
             // The wide view is not swept away: it is the whole map at a glance, it cost a pass
             // over the file to paint, and it is small - one picture for every sixty-four tiles.
             for (int level = 0; level < levels.size(); level++) {
                 int span = Tile.BLOCKS << level;      // blocks a super-tile covers here
-                long lowX = (long) Math.floor(keepMinX / span);
-                long highX = (long) Math.floor(keepMaxX / span);
-                long lowZ = (long) Math.floor(keepMinZ / span);
-                long highZ = (long) Math.floor(keepMaxZ / span);
+                double centreX = frame.centreX() / span;
+                double centreZ = frame.centreZ() / span;
+                long lowX = (long) Math.floor(centreX - keepWide);
+                long highX = (long) Math.ceil(centreX + keepWide);
+                long lowZ = (long) Math.floor(centreZ - keepTall);
+                long highZ = (long) Math.ceil(centreZ + keepTall);
                 int was = levels.get(level).size();
                 levels.get(level).keySet().removeIf(key -> {
                     int x = (int) (key >> 32);
@@ -337,7 +408,100 @@ final class TilePyramid {
                     return x < lowX || x > highX || z < lowZ || z > highZ;
                 });
             }
+            trimToBudget(frame);
         }
+    }
+
+    /**
+     * What one frame was looking at: the level it drew from, the tiles of that level it drew, and
+     * the middle of the window in blocks.
+     */
+    private record Frame(int level, long minX, long maxX, long minZ, long maxZ,
+                         double centreX, double centreZ) {
+
+        static Frame of(int level, double minX, double minZ, double maxX, double maxZ) {
+            int span = Tile.BLOCKS << Math.max(0, level);
+            return new Frame(level,
+                    (long) Math.floor(minX / span), (long) Math.floor(maxX / span),
+                    (long) Math.floor(minZ / span), (long) Math.floor(maxZ / span),
+                    (minX + maxX) / 2, (minZ + maxZ) / 2);
+        }
+
+        /** How many tiles of the drawn level the window holds. */
+        int onscreen() {
+            long wide = maxX - minX + 1;
+            long tall = maxZ - minZ + 1;
+            return (int) Math.min(Integer.MAX_VALUE, Math.max(1, wide * tall));
+        }
+
+        double halfWide() {
+            return (maxX - minX + 1) / 2.0;
+        }
+
+        double halfTall() {
+            return (maxZ - minZ + 1) / 2.0;
+        }
+
+        /** Whether this is one of the tiles the frame actually drew. */
+        boolean drawing(int atLevel, long key) {
+            if (atLevel != level) {
+                return false;
+            }
+            int x = (int) (key >> 32);
+            int z = (int) (long) key;
+            return x >= minX && x <= maxX && z >= minZ && z <= maxZ;
+        }
+    }
+
+    /**
+     * Holds what is built to {@value #MEMORY_BUDGET_BYTES} bytes, letting the furthest go first.
+     *
+     * <p>A screen is not a size. Zoomed out, one holds tens of thousands of tiles, and everything
+     * the box above keeps is by definition on screen or next to it - so on its own it is no limit
+     * at all. This is the limit: what is nearest the middle of the window is what a person is
+     * looking at and about to look at, and the rest is drawn again if they go back to it.
+     *
+     * <p>What the frame is drawing is never taken, whatever the budget says. Dropping a picture
+     * that the very next frame asks for again is not saving memory, it is a hole in the map and a
+     * rebuild every second for as long as anybody looks at it.
+     *
+     * <p>Called holding the lock.
+     */
+    private void trimToBudget(Frame frame) {
+        int perTile = Math.max(1, tileSize * tileSize * 4);      // one ARGB pixel is four bytes
+        int allowed = (int) Math.max(SWEEP_FLOOR, MEMORY_BUDGET_BYTES / perTile);
+        allowed = Math.max(allowed, frame.onscreen());
+        int held = 0;
+        for (Map<Long, BufferedImage> level : levels) {
+            held += level.size();
+        }
+        if (held <= allowed) {
+            return;
+        }
+        // Everything that may go, ranked by how far its middle is from the middle of the window.
+        // The distance is in blocks, so tiles from different levels are ranked against each other
+        // on the one scale that means the same thing at all of them.
+        record Held(int level, long key, double away) { }
+        List<Held> loose = new ArrayList<>(held);
+        for (int level = 0; level < levels.size(); level++) {
+            int span = Tile.BLOCKS << level;
+            for (long key : levels.get(level).keySet()) {
+                if (frame.drawing(level, key)) {
+                    continue;               // on screen: not this pass to give away
+                }
+                double x = ((int) (key >> 32) + 0.5) * span - frame.centreX();
+                double z = ((int) (long) key + 0.5) * span - frame.centreZ();
+                loose.add(new Held(level, key, x * x + z * z));
+            }
+        }
+        loose.sort((a, b) -> Double.compare(b.away(), a.away()));  // furthest first
+        int over = Math.min(held - allowed, loose.size());
+        for (int i = 0; i < over; i++) {
+            Held far = loose.get(i);
+            levels.get(far.level()).remove(far.key());
+            getIncompleteSince(far.level()).remove(far.key());
+        }
+        dropped.addAndGet(over);
     }
 
     /**
@@ -719,14 +883,16 @@ final class TilePyramid {
             // reached this part of the world yet: ground collected somewhere nobody has been is
             // exactly the ground that has to appear, and waiting for a sweep that has already
             // gone past is waiting forever.
-            Tile tile = store.tile(world, pack(chunkX, chunkZ));
-            if (tile != null) {
-                overview.execute(() -> {
-                    paintWide(tile);
-                    if (onTileBuilt != null) {
-                        onTileBuilt.run();  // and say so, or the window never draws it
-                    }
-                });
+            //
+            // Noted, not done. Reading the tile is a read from the map file, and this is called
+            // by whoever noticed the ground - which is the connection's own thread. It reads it
+            // on the thread that paints it, and one square noted twice before that happens is
+            // still one repaint.
+            synchronized (wideDirty) {
+                wideDirty.add(pack(chunkX, chunkZ));
+            }
+            if (widePainting.compareAndSet(false, true)) {
+                overview.execute(this::paintWideDirty);
             }
         }
         for (int level = 0; level < levels.size(); level++) {

@@ -70,13 +70,17 @@ final class MapCanvas extends JPanel {
     private static final int BLOCKS_PER_CHUNK = 32;
 
     /**
-     * How many missing tiles one frame may ask for, and how far out it looks for them.
+     * The fewest missing tiles one frame may ask for, and how many frames a cold window is
+     * allowed to take to fill.
      *
-     * <p>A window is about a hundred and thirty tiles; asking for half as many again each frame
-     * fills a cold view in a moment while leaving the builder free to keep up with what arrives.
+     * <p>Not a fixed number. A window is as many tiles as it is - a hundred and thirty in the
+     * one this was written for, ten times that maximised on a large screen at a close zoom - and
+     * a fixed sixty-four a frame meant the big one took twenty seconds to fill and looked broken
+     * while it did. What is fixed is the time: whatever is on screen is asked for over about this
+     * many frames, so a window fills in about a second whatever size it is.
      */
     private static final int ASK_PER_TICK = 64;
-    private static final int MAX_RINGS = 64;
+    private static final int FILL_FRAMES = 8;
 
     private final TilePyramid pyramid;
     private final WorldMapStore store;
@@ -436,7 +440,7 @@ final class MapCanvas extends JPanel {
 
         // Let go of what is far from here: a built tile is an image, and a map of twenty thousand
         // of them would otherwise sit in memory whole for the rest of the session.
-        pyramid.retain(worldMinX, worldMinZ, worldMaxX, worldMaxZ);
+        pyramid.retain(level, worldMinX, worldMinZ, worldMaxX, worldMaxZ);
 
         lastTilesDrawn = drawn;
         lastLevel = level;
@@ -604,29 +608,68 @@ final class MapCanvas extends JPanel {
         }
         int centreX = (minX + maxX) / 2;
         int centreZ = (minZ + maxZ) / 2;
-        int asked = 0;
-        int missing = 0;
-        for (int ring = 0; ring <= MAX_RINGS; ring++) {
-            for (int sz = centreZ - ring; sz <= centreZ + ring; sz++) {
-                for (int sx = centreX - ring; sx <= centreX + ring; sx++) {
-                    boolean onTheRing = Math.abs(sx - centreX) == ring
-                            || Math.abs(sz - centreZ) == ring;
-                    if (!onTheRing || sx < minX || sx > maxX || sz < minZ || sz > maxZ) {
-                        continue;           // only what is on screen
-                    }
-                    if (pyramid.tileIfCached(level, sx, sz) != null) {
-                        continue;
-                    }
-                    missing++;
-                    if (asked < ASK_PER_TICK && pyramid.requestBuild(level, sx, sz)) {
-                        asked++;
-                    }
-                }
+        int onscreen = (maxX - minX + 1) * (maxZ - minZ + 1);
+        // Far enough out to reach the corners of this window, not sixty-four tiles and no
+        // further: a maximised window is wider than that, and the band beyond was never asked
+        // for at all - it simply stayed empty for as long as the window was that size.
+        int rings = Math.max(Math.max(centreX - minX, maxX - centreX),
+                Math.max(centreZ - minZ, maxZ - centreZ));
+        int budget = Math.max(ASK_PER_TICK, onscreen / FILL_FRAMES);
+        Ask ask = new Ask(level, minX, maxX, minZ, maxZ, budget);
+        // Ring by ring from the middle, and each ring is walked round rather than scanned as a
+        // square: the square costs the whole of the middle again at every ring, which on a large
+        // window came to millions of lookups a frame, all of them on the drawing thread.
+        ask.at(centreX, centreZ);
+        for (int ring = 1; ring <= rings; ring++) {
+            for (int sx = centreX - ring; sx <= centreX + ring; sx++) {
+                ask.at(sx, centreZ - ring);
+                ask.at(sx, centreZ + ring);
+            }
+            for (int sz = centreZ - ring + 1; sz <= centreZ + ring - 1; sz++) {
+                ask.at(centreX - ring, sz);
+                ask.at(centreX + ring, sz);
             }
         }
-        lastMissing = missing;
-        lastVisible = (maxX - minX + 1) * (maxZ - minZ + 1);
-        return asked;
+        lastMissing = ask.missing;
+        lastVisible = onscreen;
+        return ask.asked;
+    }
+
+    /**
+     * One pass of {@link #topUp} over the tiles on screen: what is missing, and what of it this
+     * pass has room to ask for.
+     */
+    private final class Ask {
+        private final int level;
+        private final int minX;
+        private final int maxX;
+        private final int minZ;
+        private final int maxZ;
+        private final int budget;
+        private int asked;
+        private int missing;
+
+        Ask(int level, int minX, int maxX, int minZ, int maxZ, int budget) {
+            this.level = level;
+            this.minX = minX;
+            this.maxX = maxX;
+            this.minZ = minZ;
+            this.maxZ = maxZ;
+            this.budget = budget;
+        }
+
+        void at(int sx, int sz) {
+            if (sx < minX || sx > maxX || sz < minZ || sz > maxZ) {
+                return;                     // only what is on screen
+            }
+            if (pyramid.tileIfCached(level, sx, sz) != null) {
+                return;
+            }
+            missing++;
+            if (asked < budget && pyramid.requestBuild(level, sx, sz)) {
+                asked++;
+            }
+        }
     }
 
     /** What the last frame saw, for the line the window writes to the log. */

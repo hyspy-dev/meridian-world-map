@@ -99,7 +99,7 @@ tile, and the file cannot fill with old copies of itself.
 That shape is what makes the rest work:
 
 - **Opening is instant.** Only the directory is read — a 147 MB map opens in a hundredth of a
-  second, and tiles are read as they are drawn. Nothing is held in memory but what is on screen.
+  second, and tiles are read as they are drawn.
 - **A crash cannot cost the map.** Tile bytes go into free space, then the directory is written
   somewhere free, and only then does the header point at it. Every step before the last leaves
   the file exactly as it was, and the last is a few bytes at a fixed place.
@@ -107,6 +107,15 @@ That shape is what makes the rest work:
   that rewrites the file from what one session happens to hold.
 - **An unchanged tile is not written.** The directory keeps a checksum, and a server that re-sends
   the same picture every time you walk past costs nothing.
+- **A tile that cannot be read is let go of.** Not kept as a claim the map cannot honour: the
+  directory's checksum would then tell every later session that this ground is already had, and
+  the hole would outlive the damage. Dropped, it is collected again the next time somebody walks
+  past - and a map damaged by an older build heals itself as it is looked at.
+
+Space inside the file is handed out from two mouths - the holes between what the directory names,
+and new ground past the end of the file - and they must not bite in the same place. An earlier
+build let the space past the last tile be both, which wrote a run of tiles over another run: about
+a megabyte of a hundred-and-twenty-megabyte map, silently, in a file that reported itself whole.
 
 Tiles are kept at the size the server draws them (96 pixels a side in the current build), decoded
 and deflated one by one with what the JDK ships — the map has to open on a double-click, with
@@ -114,6 +123,36 @@ nothing on the class path but itself.
 
 Maps written by earlier builds were one long gzip stream. The first time such a map is opened it
 is converted, once, and the original is kept beside it as `worldmap.dat.v2`.
+
+---
+
+## What keeps it out of the way
+
+The map is a large thing bolted to a live game, and a few rules keep it from becoming the game's
+problem.
+
+**Nothing happens on the connection's thread.** A tile arriving, or ground landing under one, is
+written into a set and left there; the copying, the checksums and the map file's own reads happen
+on the module's own threads. The set is what makes it cheap however fast you fly - a column noted
+twice before anyone gets to it is one piece of work, and there is never a queue of tasks growing
+behind a player. This matters more than it sounds: that thread is the game, and a read from a
+hundred-megabyte file on it is a hundred-megabyte file's worth of frozen game.
+
+**The window holds a fixed amount of picture.** Built tiles are images, and a world is tens of
+thousands of them. Every level keeps a box around the middle of the window - as many of its own
+tiles either way as the window is drawing, and one screen further - and the whole pyramid keeps no
+more than 96 MB, the furthest from the middle going first. What the window is drawing is never
+dropped, whatever the budget says.
+
+Counting that box in tiles rather than in blocks is the point of it. A level-two screen is sixteen
+times the ground of a level-zero one, so "one screen out" measured in blocks meant level zero kept
+the entire world the moment you zoomed out - which is how a session came to hold a hundred and
+seventy thousand pictures, and then stopped.
+
+**The window fills at the size it is.** How far out tiles are asked for, and how many of them a
+frame may ask for, both come from what is on screen. A fixed sixty-four either way is what the
+map used to use, and on a maximised window that meant the band past the sixty-fourth tile was
+never asked for at all while the rest took twenty seconds to arrive.
 
 ---
 

@@ -4,7 +4,11 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import javax.swing.SwingUtilities;
 import meridian.api.event.EventPriority;
@@ -101,6 +105,22 @@ public class WorldMapModule implements ProxyModule {
     private final java.util.concurrent.atomic.AtomicBoolean arrived =
             new java.util.concurrent.atomic.AtomicBoolean();
 
+    /**
+     * Columns core has drawn a tile for, waiting to be copied into the map.
+     *
+     * <p>Nothing here happens on the thread that reads the packets. A tile arriving used to be
+     * copied, checksummed and filed there and then - and once the window was open, that same
+     * thread went on to read the map file and repaint the wide view. Which is to say the game
+     * stopped while the map thought about itself, for as long as the file took to answer. The
+     * connection's thread now writes a number into a set and goes back to the game.
+     */
+    private final Set<Long> collected = ConcurrentHashMap.newKeySet();
+    /** Columns whose ground has landed, when that is something the map draws differently. */
+    private final Set<Long> landed = ConcurrentHashMap.newKeySet();
+    /** Whether somebody is already working through them, so only ever one is. */
+    private final java.util.concurrent.atomic.AtomicBoolean collecting =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
     @Override
     public void onEnable(ModuleContext ctx) {
         this.log = ctx.getLogger();
@@ -134,10 +154,11 @@ public class WorldMapModule implements ProxyModule {
                     @Override
                     public void section(int x, int y, int z, byte[] data, byte[] localLight,
                                         byte[] globalLight) {
-                        WorldMapStore open = store;
-                        if (open != null) {
-                            open.fireUpdate(map.currentWorld(), WorldMap.key(x, z));
+                        if (everyTile || store == null) {
+                            return;         // every tile is drawn the same: nothing has changed
                         }
+                        landed.add(WorldMap.key(x, z));
+                        wake();
                     }
                 }));
 
@@ -175,21 +196,81 @@ public class WorldMapModule implements ProxyModule {
 
     // ------------------------------------------------------------------
 
-    /** A tile core has just collected: keep a copy of it. */
+    /** A tile core has just collected: note it, and copy it over away from this thread. */
     private void onTile(long key) {
         offered.incrementAndGet();
-        WorldMapStore open = store;
-        if (open == null || !keeping) {
+        if (store == null || !keeping) {
             return;                         // the map is closed, or not being kept
         }
-        UUID world = map.currentWorld();
-        followWorld(open, world);
-        map.tile(WorldMap.chunkX(key), WorldMap.chunkZ(key))
-                .map(CoreTiles::copyOf)
-                .ifPresent(tile -> {
-                    open.put(world, tile);
-                    arrived.set(true);
-                });
+        collected.add(key);
+        wake();
+    }
+
+    /**
+     * Sets somebody to work through what has been noted, unless somebody already is.
+     *
+     * <p>One at a time and no queue: what is waiting is a set, so a column noted twice before
+     * anyone gets to it is one piece of work, and a player flying through a hundred chunks a
+     * second cannot pile up a hundred tasks a second behind them.
+     */
+    private void wake() {
+        if (collecting.compareAndSet(false, true)) {
+            offload.execute(this::collect);
+        }
+    }
+
+    /**
+     * Copies over every tile noted since the last pass, and says what has landed.
+     *
+     * <p>Off the network thread, on the executor meant for work that touches a disk - which this
+     * does, by way of the checksum the map holds for a tile it already has.
+     */
+    private void collect() {
+        try {
+            for (;;) {
+                WorldMapStore open = store;
+                if (open == null) {
+                    return;
+                }
+                List<Long> tiles = take(collected);
+                List<Long> ground = take(landed);
+                if (tiles.isEmpty() && ground.isEmpty()) {
+                    return;
+                }
+                UUID world = map.currentWorld();
+                followWorld(open, world);
+                for (long key : tiles) {
+                    map.tile(WorldMap.chunkX(key), WorldMap.chunkZ(key))
+                            .map(CoreTiles::copyOf)
+                            .ifPresent(tile -> {
+                                open.put(world, tile);
+                                arrived.set(true);
+                            });
+                }
+                for (long key : ground) {
+                    // No new picture, only new ground under an old one: the window is told so it
+                    // can draw the tile as collected rather than as glimpsed.
+                    open.fireUpdate(world, key);
+                }
+            }
+        } finally {
+            collecting.set(false);
+            // Anything noted while the last pass was finishing found somebody working and went
+            // away again; look once more, and start again if it is still there.
+            if (!collected.isEmpty() || !landed.isEmpty()) {
+                wake();
+            }
+        }
+    }
+
+    /** Empties a set into a list - what was waiting when this was called, and nothing after. */
+    private static List<Long> take(Set<Long> from) {
+        if (from.isEmpty()) {
+            return List.of();
+        }
+        List<Long> batch = new ArrayList<>(from);
+        from.removeAll(batch);
+        return batch;
     }
 
     /**
