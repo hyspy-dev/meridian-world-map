@@ -69,27 +69,10 @@ final class TilePyramid {
     /** When each square was last drawn short of ground, so that answer can go stale. */
     private final List<Map<Long, Long>> incompleteSince = new ArrayList<>();
 
-    /**
-     * Whether a chunk's tile is drawn as the server painted it.
-     *
-     * <p>Every tile is kept and every tile is shown - what changes is how. Ground somebody has
-     * actually collected is drawn as it is; ground only glimpsed from a distance is drawn drained
-     * of half its colour, so one look at the map says which is which. Answering true for
-     * everything - which is what the map does when nothing can tell it apart - draws the plain
-     * map, and costs nothing.
-     */
-    @FunctionalInterface
-    interface ChunkPredicate {
-        /**
-         * @param world the world the tile belongs to - an archive holds several, and what has
-         *              been collected is asked per world
-         */
-        boolean test(UUID world, int chunkX, int chunkZ);
-    }
-
     private final WorldMapStore store;
     private final UUID world;
-    private final ChunkPredicate columnGate;
+    /** What other modules have to say about the ground, resolved into a colour a tile at a time. */
+    private final Tints tints;
     private final Runnable onTileBuilt;
     private final ExecutorService builder;
 
@@ -108,10 +91,10 @@ final class TilePyramid {
      */
     private final List<Set<Long>> staleAgain = new ArrayList<>();
 
-    TilePyramid(WorldMapStore store, UUID world, ChunkPredicate columnGate, Runnable onTileBuilt) {
+    TilePyramid(WorldMapStore store, UUID world, Tints tints, Runnable onTileBuilt) {
         this.store = store;
         this.world = world;
-        this.columnGate = columnGate;
+        this.tints = tints;
         this.onTileBuilt = onTileBuilt;
         ThreadFactory tf = r -> {
             Thread t = new Thread(r, "wd-tile-builder");
@@ -218,8 +201,9 @@ final class TilePyramid {
         adoptSize(source);
         int side = tileSize;
         int cell = Math.max(1, side >> COARSE);
-        if (!columnGate.test(world, tile.chunkX(), tile.chunkZ())) {
-            source = drained(source);
+        int tint = tints.resolve(world, tile.chunkX(), tile.chunkZ());
+        if (tint != 0) {
+            source = Tints.paint(source, tint);
         }
         int superX = tile.chunkX() >> COARSE;
         int superZ = tile.chunkZ() >> COARSE;
@@ -733,52 +717,9 @@ final class TilePyramid {
         BufferedImage image = tile.toImage();
         adoptSize(image);
         image = toGrid(image);
-        return columnGate.test(world, chunkX, chunkZ) ? image : drained(image);
+        int tint = tints.resolve(world, chunkX, chunkZ);
+        return tint == 0 ? image : Tints.paint(image, tint);
     }
-
-    /**
-     * The same tile, faded: half its colour gone and half its light.
-     *
-     * <p>Colour alone is not enough - map tiles are muted to begin with, and taking half the
-     * saturation out of stone and dirt changes nothing anyone can see. Dimming as well is what
-     * makes the two kinds of ground tell themselves apart at a glance, while the shape of the
-     * land still reads.
-     *
-     * <p>Done once, when the tile is built, because doing it on every repaint would cost the
-     * whole map on every pan.
-     */
-    private static BufferedImage drained(BufferedImage source) {
-        int w = source.getWidth();
-        int h = source.getHeight();
-        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int rgb = source.getRGB(x, y);
-                int r = (rgb >> 16) & 0xFF;
-                int g = (rgb >> 8) & 0xFF;
-                int b = rgb & 0xFF;
-                int grey = (r * 30 + g * 59 + b * 11) / 100;
-                out.setRGB(x, y, (dim(r, grey) << 16) | (dim(g, grey) << 8) | dim(b, grey));
-            }
-        }
-        return out;
-    }
-
-    /** Part of the way to grey, and a little darker - enough to tell apart, not to lose. */
-    private static int dim(int channel, int grey) {
-        double toned = channel * (1 - FADED_COLOUR) + grey * FADED_COLOUR;
-        return Math.max(0, Math.min(255, (int) (toned * FADED_LIGHT)));
-    }
-
-    /**
-     * How much light and colour a tile keeps when it is faded.
-     *
-     * <p>Gently. Halving both, which is what this used to do, turned dark ground - water, forest,
-     * anything in shadow - into the window's own background: the map looked like a thin trail of
-     * explored land in a black void. Faded ground has to stay ground.
-     */
-    private static final double FADED_LIGHT = 0.78;
-    private static final double FADED_COLOUR = 0.35;
 
     /** How big a tile is, in pixels. */
     int tileSize() {

@@ -53,20 +53,46 @@ back it up, or hand it to the standalone window on another machine.
 
 ---
 
-## Collected ground, and the rest
+## What the colours mean
 
 The server draws a tile for ground it merely shows you, which is a good deal more than the ground
 it sends you in full — a coastline seen from a hilltop is on your map long before you walk it.
 **Every tile is kept**, both kinds: a map is a record, and the far shore is worth having.
 
-What the setting changes is how they are drawn. With *Show every tile in full colour* off, ground
-nobody has collected is faded — half its colour and half its light — so one look says where you
-have actually been while the shape of the land still reads. Turn it on and the whole map is drawn
-as the server painted it.
+What any of it *means*, though, is not the map's business. Whoever knows something about a column
+— the downloader knows whether it has been collected, a comparator would know whether it matches
+what the seed should have generated there — says so in colour, by registering a layer:
 
-Telling the two apart needs something that collects the world and can say which ground it has;
-with nothing to ask, there is nothing to fade and the map is drawn plainly. The map needs no
-companion module and asks for none.
+```java
+services.get(MapTints.class).ifPresent(tints -> tints.add(myLayer));
+```
+
+A layer names a small fixed set of states, each with a colour, and answers which state a column is
+in. The map paints what it is told and knows nothing else about it. With no layers installed the
+map is drawn exactly as the server painted it, which is what a map with nothing to add should look
+like.
+
+**A colour is a direction, not paint.** Alpha says how far to pull the ground towards it; hue says
+which way; saturation says how colourful, and a grey state pulls the colour *out* of the ground
+instead of dyeing it, which reads as "we know less here" — the right way to say something about
+our own data rather than about the world; brightness dims or lifts, with `0x80` neutral.
+
+**Two layers about one column add up**, and they add up *on the circle of hues*: a red and a blue
+make a purple rather than the muddy grey that averaging colours gives you, two of the same hue
+make a stronger one, and two opposite hues cancel into grey — which is the honest answer when two
+layers disagree. Strengths compound and never reach solid. Everything here is sums and products,
+so the map looks the same however the modules happened to load.
+
+That leaves one thing to get right, and it is the reason the arithmetic is worth this much care:
+**the hues have to be spaced so no mixture lands on somebody else's meaning.** Three coloured
+facts at 120° apart leave their three mixtures in the gaps between them; anything that is not
+really a colour should be grey and then costs nothing to mix. The map checks this when a layer is
+added and says so in the log when two meanings are too close to tell apart, or when one sits where
+another pair will mix. A state that must not be blended at all can say so — the heaviest such
+state on a column wins outright.
+
+The window's settings panel lists what is currently colouring the map, state by state, straight
+off the layers themselves.
 
 ---
 

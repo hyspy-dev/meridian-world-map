@@ -52,7 +52,7 @@ public final class MapViewer extends JFrame {
 
     private final WorldMapStore store;
     private final Function<UUID, int[]> playerChunk;
-    private final TilePyramid.ChunkPredicate chunkGate;
+    private final Tints tints;
     private final Function<UUID, List<Place>> markers;
     private final Function<String, Image> icons;
     private final BiConsumer<Integer, Integer> teleport;
@@ -92,18 +92,18 @@ public final class MapViewer extends JFrame {
      * @param playerChunk {@code [chunkX, chunkZ]} of the player in that world, or null when they
      *                    are not in it - the window asks per world, since the player is only ever
      *                    in one
-     * @param chunkGate   whether a chunk's tile is drawn in full colour rather than faded
+     * @param tints       what other modules have to say about the ground, in colour
      * @param markers     the places worth naming in a world, or null when there is nobody to ask
      * @param icons       the picture a marker asks for, or null to draw plain shapes
      * @param teleport    where a right click sends the player, or null when nothing can send them
      */
     public MapViewer(WorldMapStore store, UUID world, Function<UUID, int[]> playerChunk,
-                     TilePyramid.ChunkPredicate chunkGate, Function<UUID, List<Place>> markers,
+                     Tints tints, Function<UUID, List<Place>> markers,
                      Function<String, Image> icons, BiConsumer<Integer, Integer> teleport) {
         super("Meridian - World Map");
         this.store = store;
         this.playerChunk = playerChunk == null ? w -> null : playerChunk;
-        this.chunkGate = chunkGate;
+        this.tints = tints;
         this.markers = markers;
         this.icons = icons;
         this.teleport = teleport;
@@ -250,7 +250,7 @@ public final class MapViewer extends JFrame {
         MapCanvas[] box = new MapCanvas[1];
         // A finished build asks for a redraw, and the redraw asks for the next few tiles. It is
         // marked rather than drawn: sixty finished tiles are one frame's worth of news.
-        this.pyramid = new TilePyramid(store, chosen, chunkGate, () -> arrived.set(true));
+        this.pyramid = new TilePyramid(store, chosen, tints, () -> arrived.set(true));
         this.canvas = new MapCanvas(pyramid, store, chosen,
                 () -> playerChunk.apply(chosen),
                 markers == null ? null : () -> markers.apply(chosen),
@@ -386,7 +386,7 @@ public final class MapViewer extends JFrame {
         }
         List<Place> shown = List.copyOf(markers);
         MapViewer viewer = new MapViewer(store, pickWorld(store, worlds), w -> null,
-                (w, x, z) -> true, shown.isEmpty() ? null : w -> shown, null, null);
+                Tints.none(), shown.isEmpty() ? null : w -> shown, null, null);
         if (!shown.isEmpty()) {
             viewer.setTitle(viewer.getTitle() + "   |   " + shown.size() + " marker(s)");
         }

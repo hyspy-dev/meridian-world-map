@@ -17,13 +17,12 @@ import meridian.api.module.ModuleContext;
 import meridian.api.module.ProxyModule;
 import meridian.api.service.ServiceRegistry;
 import meridian.api.settings.SettingsSpec;
-import meridian.core.api.Coverage;
+import meridian.core.api.MapTints;
 import meridian.core.api.MarkerSource;
 import meridian.core.api.Teleport;
 import meridian.core.api.Player;
 import meridian.core.api.Vec3;
 import meridian.core.api.World;
-import meridian.core.api.WorldChunks;
 import meridian.core.api.WorldMap;
 import org.slf4j.Logger;
 
@@ -34,12 +33,13 @@ import org.slf4j.Logger;
  * lets go of it when the session ends. Keeping those tiles - across worlds, across sessions, in a
  * file that is meant to grow - is this module's whole job, and the two should not be one file.
  *
- * <p>It leans on its neighbours without needing them. {@link Coverage}, when something provides
- * it, says which ground has actually been collected, and the map can be held to that;
- * {@link MarkerSource}, when something provides it, supplies markers and the pictures they are
- * drawn with. With neither there the map still works, and works fully - it keeps every tile the
- * server drew and draws its own shapes. Nothing here may require a neighbour: a module has to be
- * worth installing on its own.
+ * <p>It leans on its neighbours without needing them. {@link MapTints} is how they lean back:
+ * anything that knows something about a column - that it has not been downloaded, that it does
+ * not match the seed - registers a layer and the map draws it, without the map knowing what any
+ * of it means. {@link MarkerSource}, when something provides it, supplies markers and the
+ * pictures they are drawn with. With neither there the map still works, and works fully - it
+ * keeps every tile the server drew and draws its own shapes. Nothing here may require a
+ * neighbour: a module has to be worth installing on its own.
  *
  * <p>Layer 2: nothing here touches a packet, so one build serves every version of the game. The
  * jar is also a program of its own - double-click it and the window opens over what was collected
@@ -63,30 +63,14 @@ public class WorldMapModule implements ProxyModule {
     private WorldMap map;
     private World world;
     private ServiceRegistry services;
-    private volatile Coverage coverageCache;
     private CoreMarkers markers;
+    /** What other modules say about the ground, and the arithmetic that makes it one colour. */
+    private Tints tints;
     private WorldMapStore store;
     private Executor offload;
 
     /** Keeping tiles at all; off means core's live map still works, nothing is written down. */
     private volatile boolean keeping = true;
-    /**
-     * Whether every tile is drawn in full colour, or only the ground somebody has collected.
-     *
-     * <p>Every tile is <em>kept</em> either way - the map is a record and throwing half of it
-     * away to save a setting would be a poor trade. What this changes is the drawing: with it
-     * off, ground the server merely showed from a distance is drained of half its colour, so the
-     * map says at a glance where you have actually been. With nobody able to tell the two apart,
-     * there is nothing to fade and the map is drawn plainly.
-     */
-    /**
-     * Whether every tile is drawn in full colour.
-     *
-     * <p>True by default: a map is a map. Turning the fading on is for when the question is "which
-     * of this have I actually collected" - and even then the fading is gentle, because ground that
-     * has faded into the background is not telling anyone anything.
-     */
-    private volatile boolean everyTile = true;
     private volatile String status = "Idle.";
     /** The open window, so a change of setting can reach it. */
     private volatile MapViewer viewer;
@@ -115,8 +99,8 @@ public class WorldMapModule implements ProxyModule {
      * connection's thread now writes a number into a set and goes back to the game.
      */
     private final Set<Long> collected = ConcurrentHashMap.newKeySet();
-    /** Columns whose ground has landed, when that is something the map draws differently. */
-    private final Set<Long> landed = ConcurrentHashMap.newKeySet();
+    /** Columns a layer has changed its mind about, waiting to be drawn again. */
+    private final Set<Long> repaint = ConcurrentHashMap.newKeySet();
     /** Whether somebody is already working through them, so only ever one is. */
     private final java.util.concurrent.atomic.AtomicBoolean collecting =
             new java.util.concurrent.atomic.AtomicBoolean();
@@ -147,28 +131,30 @@ public class WorldMapModule implements ProxyModule {
 
         // Every tile core collects is copied into the archive.
         map.onTileChanged(this::onTile);
-        // A tile can arrive before the ground under it does, and while it is being held back the
-        // open window shows nothing there. When the chunk lands, say so, and the window redraws.
-        ctx.services().get(WorldChunks.class).ifPresent(chunks -> chunks.subscribe(
-                new WorldChunks.Listener() {
-                    @Override
-                    public void section(int x, int y, int z, byte[] data, byte[] localLight,
-                                        byte[] globalLight) {
-                        if (everyTile || store == null) {
-                            return;         // every tile is drawn the same: nothing has changed
-                        }
-                        landed.add(WorldMap.key(x, z));
-                        wake();
+
+        // What anybody else knows about the ground - which of it has been downloaded, which of it
+        // does not match the seed - is theirs to know and this module's to draw. They say so in
+        // colour through here; nothing about what any of it means lives in the map.
+        this.tints = new Tints(
+                (world, key) -> {                   // one column has changed
+                    repaint.add(key);
+                    wake();
+                },
+                world -> {                          // all of it has
+                    MapViewer open = viewer;
+                    if (open != null) {
+                        open.restyle();
                     }
-                }));
+                },
+                said -> log.info("world-map: {}", said));
+        ctx.services().provide(MapTints.class, tints);
 
         ctx.registerSettings(SettingsSpec.builder()
                 .bool("keep", "Keep the map across sessions", true, v -> keeping = v)
-                .bool("fadeUncollected", "Fade ground that has not been collected", false,
-                        v -> showEveryTile(!v))
                 .button("Open map", this::openViewer)
+                .liveList("Colours on the map", this::legend)
                 .liveText("Status", () -> status)
-                .persistent("keep", "fadeUncollected")
+                .persistent("keep")
                 .build());
 
         // While the session runs, what has been collected is written into the map on a timer, so
@@ -233,7 +219,7 @@ public class WorldMapModule implements ProxyModule {
                     return;
                 }
                 List<Long> tiles = take(collected);
-                List<Long> ground = take(landed);
+                List<Long> ground = take(repaint);
                 if (tiles.isEmpty() && ground.isEmpty()) {
                     return;
                 }
@@ -248,8 +234,8 @@ public class WorldMapModule implements ProxyModule {
                             });
                 }
                 for (long key : ground) {
-                    // No new picture, only new ground under an old one: the window is told so it
-                    // can draw the tile as collected rather than as glimpsed.
+                    // No new picture, only a new opinion about the old one: the window is told,
+                    // and the tile is built again with whatever the layers now say.
                     open.fireUpdate(world, key);
                 }
             }
@@ -257,7 +243,7 @@ public class WorldMapModule implements ProxyModule {
             collecting.set(false);
             // Anything noted while the last pass was finishing found somebody working and went
             // away again; look once more, and start again if it is still there.
-            if (!collected.isEmpty() || !landed.isEmpty()) {
+            if (!collected.isEmpty() || !repaint.isEmpty()) {
                 wake();
             }
         }
@@ -332,14 +318,26 @@ public class WorldMapModule implements ProxyModule {
         }
     }
 
-    /** Somebody else's word on what has been collected, if anybody is keeping it. */
-    private Coverage coverage() {
-        Coverage found = coverageCache;
-        if (found == null) {
-            found = services.get(Coverage.class).orElse(null);
-            coverageCache = found;
+    /**
+     * What the colours on the map mean, as the layers themselves describe them.
+     *
+     * <p>Read straight off the registered layers, so it says what is actually being drawn rather
+     * than what somebody wrote down here once.
+     */
+    private List<String> legend() {
+        Tints open = tints;
+        if (open == null || !open.any()) {
+            return List.of("Nothing is colouring the map.");
         }
-        return found;
+        List<String> rows = new ArrayList<>();
+        for (meridian.core.api.MapTint layer : open.layers()) {
+            rows.add(layer.name());
+            for (meridian.core.api.MapTint.Paint paint : layer.states()) {
+                rows.add("    " + paint.label() + "   #"
+                        + String.format("%08X", paint.argb()).substring(2));
+            }
+        }
+        return rows;
     }
 
     /** Opens the window over what is kept, live: tiles arriving now show up as they land. */
@@ -353,7 +351,7 @@ public class WorldMapModule implements ProxyModule {
         // right click would do rather than fail on one.
         boolean canTeleport = services.get(Teleport.class).isPresent();
         SwingUtilities.invokeLater(() -> {
-            MapViewer window = new MapViewer(open, world, this::playerChunkIn, this::plain,
+            MapViewer window = new MapViewer(open, world, this::playerChunkIn, tints,
                     markers::places, markers::icon, canTeleport ? this::goTo : null);
             viewer = window;
             window.setVisible(true);
@@ -375,29 +373,6 @@ public class WorldMapModule implements ProxyModule {
         }
         log.info("world-map: going to {}, {}", blockX, blockZ);
         teleport.toColumn(blockX, blockZ);
-    }
-
-    /**
-     * Whether a chunk's tile is drawn as the server painted it, rather than faded.
-     *
-     * <p>Collected at any point counts, not just this session: ground downloaded a week ago is
-     * ground you have. What is left faded is the rest - seen from afar, never collected.
-     */
-    private boolean plain(UUID world, int chunkX, int chunkZ) {
-        Coverage coverage = coverage();
-        return everyTile || coverage == null || coverage.hasEver(world, chunkX, chunkZ);
-    }
-
-    /** The setting changed: the open window is redrawn, since its tiles are already built. */
-    private void showEveryTile(boolean value) {
-        if (everyTile == value) {
-            return;
-        }
-        everyTile = value;
-        MapViewer open = viewer;
-        if (open != null) {
-            open.restyle();
-        }
     }
 
     /**
