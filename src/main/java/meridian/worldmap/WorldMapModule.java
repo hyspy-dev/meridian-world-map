@@ -76,6 +76,8 @@ public class WorldMapModule implements ProxyModule {
     private volatile MapViewer viewer;
     /** The world the last tile belonged to, so a change of world can be noticed. */
     private volatile UUID lastWorld;
+    /** What core calls the world before the server has named it. */
+    private static final UUID UNNAMED = new UUID(0, 0);
     /** How many tiles core has handed over this session - the first half of the story. */
     private final java.util.concurrent.atomic.AtomicInteger offered =
             new java.util.concurrent.atomic.AtomicInteger();
@@ -283,9 +285,12 @@ public class WorldMapModule implements ProxyModule {
             return;
         }
         lastWorld = world;
-        if (was != null) {
-            log.info("world-map: the world is {} now - moving what was filed under {}",
-                    world, was);
+        // Only the placeholder is moved. A real world left behind - the one a portal was taken
+        // from - keeps its tiles: moving them would merge two maps that share nothing but
+        // coordinates, and the instance's void would be drawn over the world on the way back.
+        if (UNNAMED.equals(was)) {
+            log.info("world-map: the world is {} now - moving what was filed before it was named",
+                    world);
             open.migrate(was, world);
         }
         MapViewer window = viewer;
