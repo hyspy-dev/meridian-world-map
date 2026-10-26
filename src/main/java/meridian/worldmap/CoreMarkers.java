@@ -92,14 +92,18 @@ final class CoreMarkers {
         MarkerSource kept = kept();
         if (kept != null && world != null) {
             try {
-                markers = kept.markers(world);
+                // Nothing kept for this world means nobody is keeping it yet, and the live markers
+                // are asked instead. Kept but all hidden is a different answer: it is drawn as is.
+                if (!kept.markers(world).isEmpty()) {
+                    markers = kept.shown(world);
+                }
             } catch (RuntimeException e) {
                 markers = null;             // a module that misbehaves does not blank the map
             }
         }
-        if (markers == null || markers.isEmpty()) {
+        if (markers == null) {
             MapMarkers live = live();
-            markers = live == null ? null : live.all();
+            markers = live == null ? null : shownLive(live);
         }
         if (markers == null) {
             return List.of();
@@ -130,6 +134,20 @@ final class CoreMarkers {
                 return Optional.empty();
             }
         }).orElse(null);
+    }
+
+    /**
+     * The live markers the in-game map shows. Without the markers module there are no switches,
+     * only what was hidden or deleted - and the waypoint budget, which this window inherits.
+     */
+    private static List<Marker> shownLive(MapMarkers live) {
+        List<Marker> out = new ArrayList<>();
+        for (Marker marker : live.all()) {
+            if (!live.isHidden(marker.id())) {
+                out.add(marker);
+            }
+        }
+        return out;
     }
 
     private static Place place(Marker marker) {
